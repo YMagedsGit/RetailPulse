@@ -17,9 +17,6 @@ images/
   kafka-sample-output.png
 ```
 
-The two Spark scripts aren't pasted into this README, they're pushed as actual `.py` files in `spark/`. Below I just describe what each one does and show the outputs I got when I ran them.
-
----
 
 ## 1. Kafka: create the topic first
 
@@ -38,54 +35,7 @@ kafka-console-consumer.sh --bootstrap-server kafka:9092 \
 
 ## 2. Flume: spooldir -> Kafka
 
-Config lives in `flume/retailpulse_flume.conf`:
-
-```bash
-retail.sources = dir
-retail.channels = buffer
-retail.sinks = kafka
-
-retail.sources.dir.type = spooldir
-retail.sources.dir.spoolDir = /var/log/flume_lab/retailpulse
-retail.sources.dir.batchSize = 500
-retail.sources.dir.channels = buffer
-
-retail.sources.dir.ignorePattern = ^.*\.tmp$
-retail.sources.dir.fileSuffix = .COMPLETED
-retail.sources.dir.deletePolicy = never
-retail.sources.dir.deserializer = LINE
-retail.sources.dir.deserializer.maxLineLength = 8192
-retail.sources.dir.inputCharset = UTF-8
-
-retail.sources.dir.basenameHeader = true
-retail.sources.dir.basenameHeaderKey = source_file
-
-# ---------- Interceptor ----------
-retail.sources.dir.interceptors = i_key
-
-retail.sources.dir.interceptors.i_key.type = regex_extractor
-retail.sources.dir.interceptors.i_key.regex = "session_id"\s*:\s*"([^"]+)"
-retail.sources.dir.interceptors.i_key.serializers = s1
-retail.sources.dir.interceptors.i_key.serializers.s1.name = key
-
-# ---------- Channel ----------
-retail.channels.buffer.type = file
-retail.channels.buffer.checkpointDir = /var/lib/flume/retail/checkpoint
-retail.channels.buffer.dataDirs = /var/lib/flume/retail/data
-retail.channels.buffer.capacity = 100000
-retail.channels.buffer.transactionCapacity = 500
-
-# ---------- Sink: Kafka ----------
-retail.sinks.kafka.type = org.apache.flume.sink.kafka.KafkaSink
-retail.sinks.kafka.channel = buffer
-retail.sinks.kafka.kafka.bootstrap.servers = kafka:9092
-retail.sinks.kafka.kafka.topic = retailpulse
-retail.sinks.kafka.flumeBatchSize = 500
-retail.sinks.kafka.kafka.producer.acks = all
-retail.sinks.kafka.kafka.producer.compression.type = snappy
-retail.sinks.kafka.kafka.producer.linger.ms = 20
-retail.sinks.kafka.useFlumeEventFormat = false
-```
+Config is in `flume/flume.conf`:
 
 The `regex_extractor` interceptor pulls `session_id` out of the JSON line and uses it as the Kafka message key, so all events from one session land in the same partition (ordering within a session). File channel instead of memory so a crash mid-batch doesn't just lose events sitting in RAM.
 
@@ -201,7 +151,7 @@ SELECT COUNT(*) FROM (
 -- 0
 ```
 
-40,000 because I ended up running the generator 4 times total (not 3), no duplicate (partition, offset) pairs, which is the real proof nothing got double-written. Bronze is done.
+40,000 because I ended up running the generator 4 times total (not 3) ran one more time after the running spark to make sure it will read the new data while it's being pushed and it did, no duplicate (partition, offset) pairs, which is the real proof nothing got double-written. Bronze is done.
 
 ---
 

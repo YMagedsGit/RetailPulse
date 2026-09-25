@@ -1,0 +1,343 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}</style><style>:root{color-scheme:light dark;--md-bg:#fff;--md-text:rgba(0,0,0,.8);--md-muted:rgba(0,0,0,.6);--md-fill:rgba(0,0,0,.04);--md-fill-strong:rgba(0,0,0,.06);--md-rule:rgba(0,0,0,.1);--md-rule-strong:rgba(0,0,0,.16);--md-link:hsl(210 100% 45%)}@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])){--md-bg:#0d0d0d;--md-text:rgba(255,255,255,.85);--md-muted:rgba(255,255,255,.6);--md-fill:rgba(255,255,255,.06);--md-fill-strong:rgba(255,255,255,.09);--md-rule:rgba(255,255,255,.14);--md-rule-strong:rgba(255,255,255,.22);--md-link:hsl(210 100% 72%)}}:root[data-theme="dark"]{color-scheme:dark;--md-bg:#0d0d0d;--md-text:rgba(255,255,255,.85);--md-muted:rgba(255,255,255,.6);--md-fill:rgba(255,255,255,.06);--md-fill-strong:rgba(255,255,255,.09);--md-rule:rgba(255,255,255,.14);--md-rule-strong:rgba(255,255,255,.22);--md-link:hsl(210 100% 72%)}:root[data-theme="light"]{color-scheme:light}@media print{:root,:root[data-theme="dark"]{color-scheme:light;--md-bg:#fff;--md-text:rgba(0,0,0,.8);--md-muted:rgba(0,0,0,.6);--md-fill:rgba(0,0,0,.04);--md-fill-strong:rgba(0,0,0,.06);--md-rule:rgba(0,0,0,.1);--md-rule-strong:rgba(0,0,0,.16);--md-link:hsl(210 100% 45%)}}body{background:var(--md-bg);color:var(--md-text);max-width:720px;margin:0 auto;padding:32px;display:flex;flex-direction:column;gap:10px;font:14px/1.55 -apple-system,BlinkMacSystemFont,'SF Pro','Segoe UI',sans-serif;overflow-wrap:break-word}body>:first-child{margin-top:0}h1,h2,h3,h4,h5,h6{margin:6px 0 0;line-height:1.25;font-weight:600;text-wrap:balance}h1{font-size:1.35em}h2{font-size:1.15em;color:var(--md-muted)}h3,h4,h5,h6{font-size:1em}p,ul,ol,blockquote,table,pre,hr{margin:0}strong{font-weight:600}a{color:var(--md-link);text-decoration:none}a:hover{text-decoration:underline}ul,ol{display:flex;flex-direction:column;gap:6px;padding-left:22px}ul{list-style:disc}ol{list-style:decimal}:is(li,td,th)>*+:is(p,ul,ol,blockquote){margin-top:6px}blockquote{display:flex;flex-direction:column;gap:10px;border-left:2px solid var(--md-rule);padding-left:10px;color:var(--md-muted)}:not(pre)>code{background:var(--md-fill);padding:1px 3px;border-radius:4px;font:.92em 'SF Mono',ui-monospace,Menlo,Consolas,monospace}a>code{background:none;color:inherit}pre{background:var(--md-fill);padding:10px 12px;border-radius:6px;overflow-x:auto;font:12px/1.5 'SF Mono',ui-monospace,Menlo,Consolas,monospace;margin-block:4px}pre code{background:none;padding:0;font:inherit}table{width:100%;border-collapse:separate;border-spacing:2px;font:inherit}th,td{padding:6px 8px;border-radius:3px;text-align:left;vertical-align:top}th{background:var(--md-fill-strong);font-weight:600}td{background:var(--md-fill)}:is(th,td) :not(pre)>code{background:transparent}hr{border:0;border-top:1px solid var(--md-rule-strong);margin-block:10px}img{max-width:100%;height:auto;border-radius:4px}</style>
+</head><body>
+<h1>RetailPulse - Streaming Part (Flume -&gt; Kafka -&gt; Spark -&gt; Bronze -&gt; Silver)</h1>
+<p>This is the first half of the RetailPulse capstone. It covers the application-event
+side of the pipeline: generating events, moving them through Flume into Kafka,
+landing them raw in Bronze with Spark Structured Streaming, then cleaning them up
+into Silver. The relational side (Sqoop from PostgreSQL) is a separate track and
+will get its own section once it's done.</p>
+<h2>What's in this repo (streaming part)</h2>
+<pre><code>flume/
+  retailpulse_flume.conf
+spark/
+  bronze_events_stream.py
+  silver_events.py
+generator/
+  generate_retailpulse_events.py
+images/
+  flume-completed-count.png
+  kafka-sample-output.png
+</code></pre>
+<p>The two Spark scripts aren't pasted into this README, they're pushed as actual
+<code>.py</code> files in <code>spark/</code>. Below I just describe what each one does and show the
+outputs I got when I ran them.</p>
+<hr>
+<h2>1. Kafka: create the topic first</h2>
+<p>Started with Kafka to make a topic and a consumer so I could see the output
+before touching Flume.</p>
+<pre><code class="language-bash">docker exec -it 07-01-kafka bash
+kafka-topics.sh --bootstrap-server kafka:9092 \
+  --create --topic retailpulse --partitions 6 --replication-factor 1
+
+kafka-console-consumer.sh --bootstrap-server kafka:9092 \
+  --topic retailpulse --from-beginning
+</code></pre>
+<p>6 partitions because I want Spark to be able to parallelize reading later, and
+because the message key (<code>session_id</code>) will spread across a decent number of
+sessions anyway. Now Kafka just sits there waiting for Flume to send it something.</p>
+<h2>2. Flume: spooldir -&gt; Kafka</h2>
+<p>Config lives in <code>flume/retailpulse_flume.conf</code>:</p>
+<pre><code class="language-bash">retail.sources = dir
+retail.channels = buffer
+retail.sinks = kafka
+
+retail.sources.dir.type = spooldir
+retail.sources.dir.spoolDir = /var/log/flume_lab/retailpulse
+retail.sources.dir.batchSize = 500
+retail.sources.dir.channels = buffer
+
+retail.sources.dir.ignorePattern = ^.*\.tmp$
+retail.sources.dir.fileSuffix = .COMPLETED
+retail.sources.dir.deletePolicy = never
+retail.sources.dir.deserializer = LINE
+retail.sources.dir.deserializer.maxLineLength = 8192
+retail.sources.dir.inputCharset = UTF-8
+
+retail.sources.dir.basenameHeader = true
+retail.sources.dir.basenameHeaderKey = source_file
+
+# ---------- Interceptor ----------
+retail.sources.dir.interceptors = i_key
+
+retail.sources.dir.interceptors.i_key.type = regex_extractor
+retail.sources.dir.interceptors.i_key.regex = &#34;session_id&#34;\s*:\s*&#34;([^&#34;]+)&#34;
+retail.sources.dir.interceptors.i_key.serializers = s1
+retail.sources.dir.interceptors.i_key.serializers.s1.name = key
+
+# ---------- Channel ----------
+retail.channels.buffer.type = file
+retail.channels.buffer.checkpointDir = /var/lib/flume/retail/checkpoint
+retail.channels.buffer.dataDirs = /var/lib/flume/retail/data
+retail.channels.buffer.capacity = 100000
+retail.channels.buffer.transactionCapacity = 500
+
+# ---------- Sink: Kafka ----------
+retail.sinks.kafka.type = org.apache.flume.sink.kafka.KafkaSink
+retail.sinks.kafka.channel = buffer
+retail.sinks.kafka.kafka.bootstrap.servers = kafka:9092
+retail.sinks.kafka.kafka.topic = retailpulse
+retail.sinks.kafka.flumeBatchSize = 500
+retail.sinks.kafka.kafka.producer.acks = all
+retail.sinks.kafka.kafka.producer.compression.type = snappy
+retail.sinks.kafka.kafka.producer.linger.ms = 20
+retail.sinks.kafka.useFlumeEventFormat = false
+</code></pre>
+<p>The <code>regex_extractor</code> interceptor pulls <code>session_id</code> out of the JSON line and
+uses it as the Kafka message key, so all events from one session land in the
+same partition (ordering within a session). File channel instead of memory so
+a crash mid-batch doesn't just lose events sitting in RAM.</p>
+<p>Spooldir picks files up, renames them to <code>.COMPLETED</code> once read, and never
+deletes them (<code>deletePolicy = never</code>), so I still have the raw files on disk
+as evidence even after Kafka has them.</p>
+<h2>3. Generating the events</h2>
+<p>Used the generator script (<code>generator/generate_retailpulse_events.py</code>), ran it
+3 times, so I should end up with 30,000 events from the generator plus whatever
+came before -&gt; more on the final count below.</p>
+<p>Checked the file count landed correctly:</p>
+<pre><code class="language-bash">docker exec -it 06-02-flume bash
+cd /var/log/flume_lab/retailpulse
+cat *.COMPLETED | wc -l
+</code></pre>
+<p><img src="images/flume-completed-count.png" alt="Flume completed file line count"></p>
+<p>30,000 - matches.</p>
+<p>Sample of what showed up on the Kafka consumer side:</p>
+<p><img src="images/kafka-sample-output.png" alt="Kafka console consumer sample"></p>
+<h2>4. Checking Kafka partition offsets</h2>
+<pre><code class="language-bash">kafka-run-class.sh kafka.tools.GetOffsetShell --broker-list kafka:9092 --topic retailpulse
+retailpulse:0:4952
+retailpulse:1:4997
+retailpulse:2:5049
+retailpulse:3:4974
+retailpulse:4:4815
+retailpulse:5:5213
+</code></pre>
+<p>Sum of these = 30,000, which matches the file line count. Nothing lost between
+Flume and Kafka.</p>
+<hr>
+<h2>5. Bronze layer</h2>
+<p>Now that streaming into Kafka is proven, moved to Hive + Spark to actually land
+the data and finish Bronze.</p>
+<p>Connect to Hive:</p>
+<pre><code class="language-bash">docker exec -it 02-03-hive-server beeline -u &#39;jdbc:hive2://localhost:10000/&#39;
+</code></pre>
+<pre><code class="language-sql">CREATE DATABASE IF NOT EXISTS retailpulse_bronze;
+
+CREATE EXTERNAL TABLE IF NOT EXISTS retailpulse_bronze.app_events_raw (
+    kafka_key        STRING,
+    raw_payload      STRING,
+    kafka_topic      STRING,
+    kafka_partition  INT,
+    kafka_offset     BIGINT,
+    kafka_timestamp  TIMESTAMP,
+    ingested_at      TIMESTAMP
+)
+PARTITIONED BY (ingest_date STRING)
+STORED AS PARQUET
+LOCATION &#39;hdfs://namenode:8020/retailpulse/bronze/app_events_raw&#39;;
+</code></pre>
+<p>External table since Hive isn't the one writing to it, Spark streaming is.
+Bronze keeps the raw payload untouched plus enough Kafka metadata
+(topic/partition/offset/timestamp) to trace any row back to where it came from
+in Kafka.</p>
+<p>Spark job: <code>spark/bronze_events_stream.py</code>. What it does:</p>
+<ul>
+<li>reads the <code>retailpulse</code> topic from <code>earliest</code></li>
+<li>keeps <code>key</code>, <code>value</code> (raw JSON string, untouched), <code>topic</code>, <code>partition</code>,
+<code>offset</code>, <code>timestamp</code></li>
+<li>stamps <code>ingested_at</code> = when Spark actually wrote it</li>
+<li>partitions the Parquet output by <code>ingest_date</code></li>
+<li>runs with <code>trigger(once=True)</code> so it processes what's there and stops, rather
+than running forever - I re-run it whenever new files show up instead of
+keeping a long-running stream up</li>
+</ul>
+<p>Run with:</p>
+<pre><code class="language-bash">spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:2.4.1 \
+  /mnt/notebooks/jobs/bronze_events_stream.py
+</code></pre>
+<h3>Verifying Bronze</h3>
+<pre><code class="language-sql">SELECT COUNT(*) FROM retailpulse_bronze.app_events_raw;
+-- 40000
+
+SELECT kafka_partition, COUNT(*), MIN(kafka_offset), MAX(kafka_offset)
+FROM retailpulse_bronze.app_events_raw GROUP BY kafka_partition;
+</code></pre>
+<pre><code>+------------------+-------+------+-------+
+| kafka_partition  |  _c1  | _c2  |  _c3  |
++------------------+-------+------+-------+
+| 0                | 6603  | 0    | 6602  |
+| 1                | 6663  | 0    | 6662  |
+| 2                | 6731  | 0    | 6730  |
+| 3                | 6632  | 0    | 6631  |
+| 4                | 6420  | 0    | 6419  |
+| 5                | 6951  | 0    | 6950  |
++------------------+-------+------+-------+
+</code></pre>
+<pre><code class="language-sql">SELECT COUNT(*) FROM (
+  SELECT kafka_partition, kafka_offset FROM retailpulse_bronze.app_events_raw
+  GROUP BY kafka_partition, kafka_offset HAVING COUNT(*) &gt; 1) d;
+-- 0
+</code></pre>
+<p>40,000 because I ended up running the generator 4 times total (not 3), no
+duplicate (partition, offset) pairs, which is the real proof nothing got
+double-written. Bronze is done.</p>
+<hr>
+<h2>6. Silver layer</h2>
+<p>Now that Bronze is solid, moved to cleaning it up into Silver: parse the JSON,
+tag anything broken as a reject, and de-duplicate on <code>event_id</code>.</p>
+<h3>Tables</h3>
+<pre><code class="language-sql">CREATE DATABASE IF NOT EXISTS retailpulse_silver;
+
+CREATE EXTERNAL TABLE IF NOT EXISTS retailpulse_silver.app_events (
+  event_id STRING, event_type STRING, event_ts TIMESTAMP,
+  customer_id INT, session_id STRING, order_id BIGINT,
+  product_id INT, store_id INT, channel STRING, `sequence` BIGINT,
+  kafka_partition INT, kafka_offset BIGINT, ingested_at TIMESTAMP
+)
+PARTITIONED BY (event_date STRING)
+STORED AS PARQUET
+LOCATION &#39;hdfs://namenode:8020/retailpulse/silver/app_events&#39;;
+
+CREATE EXTERNAL TABLE IF NOT EXISTS retailpulse_silver.app_events_rejects (
+  raw_payload STRING, reject_reason STRING,
+  kafka_partition INT, kafka_offset BIGINT,
+  kafka_timestamp TIMESTAMP, ingested_at TIMESTAMP
+)
+PARTITIONED BY (ingest_date STRING)
+STORED AS PARQUET
+LOCATION &#39;hdfs://namenode:8020/retailpulse/silver/app_events_rejects&#39;;
+
+CREATE EXTERNAL TABLE IF NOT EXISTS retailpulse_silver.app_events_duplicates (
+  event_id STRING, event_type STRING, event_ts TIMESTAMP, `sequence` BIGINT,
+  kafka_partition INT, kafka_offset BIGINT, ingested_at TIMESTAMP
+)
+PARTITIONED BY (ingest_date STRING)
+STORED AS PARQUET
+LOCATION &#39;hdfs://namenode:8020/retailpulse/silver/app_events_duplicates&#39;;
+</code></pre>
+<p>Three tables: the clean events, the ones that got rejected (with a reason so I
+can audit them), and the ones that were duplicates (kept, not deleted, for the
+same reason).</p>
+<h3>The script</h3>
+<p><code>spark/silver_events.py</code> does the following, in order:</p>
+<ol>
+<li>reads all of Bronze with <code>spark.read.parquet(...)</code> (never through
+<code>spark.sql</code>/<code>spark.read.table</code> - Spark and Hive on this stack disagree on
+how they write/read Parquet metadata classes, so anything that goes through
+the Hive metastore from Spark risks a <code>NoClassDefFoundError</code>. Reading/writing
+straight off the HDFS path sidesteps that completely)</li>
+<li>parses <code>raw_payload</code> as JSON with <code>PERMISSIVE</code> mode</li>
+<li>standardizes types (<code>event_id</code> trimmed, <code>event_type</code>/<code>channel</code> lowercased +
+trimmed, timestamps and numeric fields cast properly)</li>
+<li>runs the data-quality rules below, first match wins, and tags each row with
+a <code>reject_reason</code></li>
+<li>de-duplicates whatever's left on <code>event_id</code>, using a window ordered by
+<code>ingested_at</code> -&gt; <code>sequence</code> -&gt; <code>kafka_partition</code> -&gt; <code>kafka_offset</code>, keeping
+only <code>rn = 1</code></li>
+<li>writes the three outputs, overwriting the existing partitions each run</li>
+</ol>
+<h3>Data-quality rules (first one that matches wins)</h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Rule</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>JSON didn't parse at all</td>
+<td><code>UNPARSEABLE_JSON</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>event_id</code> missing/empty</td>
+<td><code>MISSING_EVENT_ID</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>event_type</code> not one of the 5 known types</td>
+<td><code>INVALID_EVENT_TYPE</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>event_timestamp</code> didn't parse</td>
+<td><code>INVALID_EVENT_TIMESTAMP</code></td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>event_timestamp</code> more than 5 min in the future</td>
+<td><code>FUTURE_EVENT_TIMESTAMP</code></td>
+</tr>
+<tr>
+<td>6</td>
+<td><code>channel</code> not <code>web</code>/<code>mobile</code></td>
+<td><code>INVALID_CHANNEL</code></td>
+</tr>
+<tr>
+<td>7</td>
+<td><code>order_confirmed</code>/<code>fulfillment_update</code> with no <code>order_id</code></td>
+<td><code>MISSING_ORDER_ID</code></td>
+</tr>
+</tbody>
+</table>
+<h3>Running it and the output</h3>
+<pre><code class="language-bash">&gt;&gt;&gt; print(&#34;Silver:&#34;, spark.read.parquet(
+...     &#34;hdfs://namenode:8020/retailpulse/silver/app_events&#34;
+... ).count())
+Silver: 37636
+&gt;&gt;&gt; print(&#34;Rejects:&#34;, spark.read.parquet(
+...     &#34;hdfs://namenode:8020/retailpulse/silver/app_events_rejects&#34;
+... ).count())
+Rejects: 380
+&gt;&gt;&gt; print(&#34;Duplicates:&#34;, spark.read.parquet(
+...     &#34;hdfs://namenode:8020/retailpulse/silver/app_events_duplicates&#34;
+... ).count())
+Duplicates: 1984
+</code></pre>
+<p>$$37{,}636 + 380 + 1{,}984 = 40{,}000$$</p>
+<p>Everything accounted for, nothing silently dropped.</p>
+<h3>Verifying Silver is actually right</h3>
+<pre><code class="language-sql">SELECT reject_reason, COUNT(*) FROM retailpulse_silver.app_events_rejects GROUP BY reject_reason;
+</code></pre>
+<pre><code>+-------------------+------+
+|   reject_reason   | _c1  |
++-------------------+------+
+| UNPARSEABLE_JSON  | 380  |
++-------------------+------+
+</code></pre>
+<p>(This took a fix - originally these 380 rows were falling through to
+<code>MISSING_EVENT_ID</code> because <code>from_json</code> returns a null struct instead of
+populating <code>_corrupt</code> for these truncated lines. Added an explicit
+<code>isNull()</code> check on the parsed struct so rule 1 actually catches them.)</p>
+<pre><code class="language-sql">SELECT COUNT(*) - COUNT(DISTINCT event_id) FROM retailpulse_silver.app_events;
+</code></pre>
+<pre><code>+------+
+| _c0  |
++------+
+| 0    |
++------+
+</code></pre>
+<p>No duplicate <code>event_id</code>s left in Silver. All good.</p>
+<h3>Note on the late events / duplicates overlap</h3>
+<p>Silver's <code>event_date</code> only shows 2 dates (today and yesterday), even though the
+generator shifts about 3% of events back 1-3 days. Checked this against Bronze
+directly and it's not a bug - in the generator, the &quot;late&quot; check and the
+&quot;duplicate&quot; check use the same random roll and the duplicate range fully
+contains the late range, so almost every late-shifted event also gets its
+<code>event_id</code> overwritten into a duplicate. That means the late-timestamped copy
+correctly gets caught by dedup and routed to <code>app_events_duplicates</code> (where its
+true timestamp is still visible), not into <code>app_events</code>. So this is expected
+generator behavior, not a Silver defect - just noting it here so it doesn't
+look like an unexplained gap later.</p>
+<hr>
+<h2>Where this stands</h2>
+<p>Streaming part (Flume -&gt; Kafka -&gt; Spark -&gt; Bronze -&gt; Silver) is done and
+verified: counts reconcile, rejects are labeled correctly, no duplicate
+<code>event_id</code>s in Silver, and reruns don't change the numbers.</p>
+<p>Next up: Sqoop ingestion of the <code>capstone_retail</code> PostgreSQL tables into their
+own Bronze/Silver tables (separate track, not related to the events data),
+then Gold on top of both, then the Metabase dashboard.</p>
+
+</body></html>
